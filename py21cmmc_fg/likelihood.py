@@ -14,8 +14,8 @@ from astropy import units as un
 from cached_property import cached_property
 from powerbox.dft import fft, fftfreq
 from powerbox.tools import angular_average_nd
-from py21cmmc.mcmc.core import CoreLightConeModule
-from py21cmmc.mcmc.likelihood import LikelihoodBaseFile
+from py21cmmc.core import CoreLightConeModule
+from py21cmmc.likelihood import LikelihoodBaseFile
 from scipy.integrate import quad
 from scipy.special import erf
 from scipy import signal
@@ -128,7 +128,8 @@ class LikelihoodInstrumental2D(LikelihoodBaseFile):
             self.noise = self.noise[0]
 
         #Store only the p_signal
-        self.data = {"p_signal":self.data["p_signal"]}
+        if self.data is not None:
+            self.data = {"p_signal":self.data["p_signal"]}
 
     @cached_property
     def n_uv(self):
@@ -452,8 +453,9 @@ class LikelihoodInstrumental2D(LikelihoodBaseFile):
             The first is kperp, and the second is kpar.
         """
         # Grid visibilities only if we're not using "grid_centres"
-
-        if self.baselines_type != "grid_centres":
+        if self._instr_core.antenna_posfile != "grid_centres":
+        # if self.baselines_type != "grid_centres":
+        # if ctx.get("baselines_type") != "grid_centres":
             if(self.n_obs==1):
                 visgrid,kernel_weights = self.grid_visibilities(visibilities)
             else:
@@ -767,7 +769,9 @@ class LikelihoodInstrumental2D(LikelihoodBaseFile):
         """
         Centres of the uv grid along a side.
         """
-        if self.baselines_type != "grid_centres":
+        if self._instr_core.antenna_posfile != "grid_centres":
+        # if self.baselines_type != "grid_centres":
+        # if ctx.get("baselines_type") != "grid_centres":
             ugrid = np.linspace(-self.uv_max, self.uv_max, self.n_uv + 1)  # +1 because these are bin edges.
             return (ugrid[1:] + ugrid[:-1]) / 2
         else:
@@ -777,7 +781,9 @@ class LikelihoodInstrumental2D(LikelihoodBaseFile):
     @cached_property
     def uv_max(self):
         if self._uv_max is None:
-            if self.baselines_type != "grid_centres":
+            if self._instr_core.antenna_posfile != "grid_centres":
+            # if self.baselines_type != "grid_centres":
+            # if ctx.get("baselines_type") != "grid_centres":
                 return (max([np.abs(b).max() for b in self.baselines]) * self.frequencies.min() / const.c).value
             else:
                 # return the uv

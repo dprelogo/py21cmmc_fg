@@ -16,7 +16,7 @@ from astropy import constants as const
 from astropy import units as un
 from powerbox import LogNormalPowerBox
 from powerbox.dft import fft, fftfreq
-from py21cmmc.mcmc.core import CoreBase, NotSetupError
+from py21cmmc.core import CoreBase, NotSetupError
 from scipy.integrate import quad
 from scipy.interpolate import RegularGridInterpolator, RectBivariateSpline
 import multiprocessing as mp

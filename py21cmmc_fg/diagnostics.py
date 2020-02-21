@@ -1,7 +1,7 @@
 """
 A module which contains functions providing diagnostic information/plots on chains, either pre- or post-MCMC.
 """
-from py21cmmc.mcmc import build_computation_chain, CoreLightConeModule
+from py21cmmc import build_computation_chain, CoreLightConeModule
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -53,7 +53,7 @@ def imaging(chain=None, cores=None, lk=None, freq_ind=0):
         chain.setup()
 
     # Call all core simulators.
-    ctx = chain.core_simulated_context()
+    ctx = chain.build_model_data()
 
     visgrid = lk.grid_visibilities(ctx.get("visibilities"))
 
