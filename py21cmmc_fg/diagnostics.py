@@ -58,6 +58,7 @@ def imaging(chain=None, cores=None, lk=None, freq_ind=0):
     visgrid = lk.grid_visibilities(ctx.get("visibilities"))
 
     # Do a direct FT there and back, rather than baselines.
+    print(ctx.get("new_sky"))
     direct_vis, direct_u = fft(ctx.get("new_sky")[:, :, freq_ind], L=lk._instr_core.sky_size, a=0, b=2 * np.pi)
     direct_img, direct_l = ifft(direct_vis, Lk=(lk.uvgrid[1] - lk.uvgrid[0]) * len(lk.uvgrid), a=0, b=2 * np.pi)
 

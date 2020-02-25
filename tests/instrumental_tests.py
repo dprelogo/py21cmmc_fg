@@ -32,7 +32,7 @@ def test_imaging_grid(core_ss):
         nfreq=2,
         n_cells=300,
         sky_extent=3,
-        antenna_posfile='grid_centres',
+        antenna_posfile="mwa_phase2",
         Tsys=0
     )
 

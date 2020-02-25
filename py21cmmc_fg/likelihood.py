@@ -586,15 +586,19 @@ class LikelihoodInstrumental2D(LikelihoodBaseFile):
         centres = (ugrid[1:] + ugrid[:-1]) / 2
 
         visgrid = np.zeros((self.n_uv, self.n_uv, len(self.frequencies)), dtype=np.complex128)
-
-        if(os.path.exists(self.datafile[0][:-4]+".kernel_weights.npy")):
-            kernel_weights = np.load(self.datafile[0][:-4]+".kernel_weights.npy")
+        if self.datafile != None:
+            if(os.path.exists(self.datafile[0][:-4]+".kernel_weights.npy")):
+                kernel_weights = np.load(self.datafile[0][:-4]+".kernel_weights.npy")
+            else:
+                kernel_weights=None
         else:
-            kernel_weights=None
+            kernel_weights = None
 
         if kernel_weights is None:
             weights = np.zeros((self.n_uv, self.n_uv, len(self.frequencies)))
 
+        # print(self.baselines)
+        # self.baselines = np.broadcast_to(self.baselines[..., np.newaxis], self.baselines.shape + (2,))
         for jj, freq in enumerate(self.frequencies):
             u_bl = (self.baselines[:,0] * freq / const.c).value
             v_bl = (self.baselines[:,1] * freq / const.c).value
