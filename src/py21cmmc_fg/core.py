@@ -11,18 +11,17 @@ import logging
 from os import path
 
 import numpy as np
-import py21cmmc as p21
 from astropy import constants as const
 from astropy import units as un
-from powerbox import LogNormalPowerBox
+from powerbox import LogNormalPowerBox, PowerBox
 from powerbox.dft import fft, fftfreq
-from py21cmmc.mcmc.core import CoreBase, NotSetupError
+from py21cmmc.mcmc.core import CoreBase, NotSetupError, CoreLightConeModule
 from scipy.integrate import quad
 from scipy.interpolate import RegularGridInterpolator, RectBivariateSpline
 import multiprocessing as mp
 import ctypes
 
-logger = logging.getLogger("21CMMC")
+logger = logging.getLogger("21cmFAST")
 
 import warnings
 
@@ -37,6 +36,21 @@ except NameError:
     def profile(fnc):
         return fnc
 
+class UnitArray(np.ndarray):
+
+    def __new__(cls, input_array, unit=None):
+        # Input array is an already formed ndarray instance
+        # We first cast to be our class type
+        obj = np.asarray(input_array).view(cls)
+        # add the new attribute to the created instance
+        obj.unit = unit
+        # Finally, we must return the newly created object:
+        return obj
+
+    def __array_finalize__(self, obj):
+        # see InfoArray.__array_finalize__ for comments
+        if obj is None: return
+        self.unit = getattr(obj, 'unit', None)
 
 class ForegroundsBase(CoreBase):
     """
@@ -156,15 +170,13 @@ class ForegroundsBase(CoreBase):
         """
         # build_model_data is called before this method, so we do not need to
         # update parameters. We just build the sky:
-        if (self.model_params['S_min'] != self.model_params['S_max']):
-            fg_lightcone = self.build_sky(**self.model_params)
-        else:
-            fg_lightcone = np.zeros((self.n_cells, self.n_cells, len(self.frequencies)))
+        fg_lightcone = self.build_sky(**self.model_params)
 
         # Get the foregrounds list out of the context, defaulting to empty list.
         fg = ctx.get("foregrounds", [])
         fg.append(fg_lightcone)
-        if len(fg) == 1:
+        
+        if len(fg) >= 1:
             ctx.add("foregrounds", fg)
 
     def build_model_data(self, ctx):
@@ -260,7 +272,7 @@ class CorePointSourceForegrounds(ForegroundsBase):
         # Divide by cell area to get in Jy/sr (proportional to K)
         sky /= self.cell_area
 
-        return sky
+        return UnitArray(sky, unit= 'JyperSr')
 
 
 class CoreDiffuseForegrounds(ForegroundsBase):
@@ -268,13 +280,13 @@ class CoreDiffuseForegrounds(ForegroundsBase):
     A 21CMMC Core MCMC module which adds diffuse foregrounds to the base signal.
     """
 
-    def __init__(self, *args, u0=10.0, eta=0.01, rho=-2.7, mean_temp=253e3, kappa=-2.55, **kwargs):
+    def __init__(self, *args, u0=10.0, eta=0.01, rho=-2.7, mean_temp=253e3, kappa=-2.55, distribution = "Gaussian", **kwargs):
         super().__init__(*args,
                          model_params=dict(u0=u0, eta=eta, rho=rho, mean_temp=mean_temp, kappa=kappa),
                          **kwargs)
 
-    @staticmethod
-    def build_sky(frequencies, ncells, sky_size, u0=10.0, eta=0.01, rho=-2.7, mean_temp=253e3, kappa=-2.55):
+    @profile
+    def build_sky(self, u0=10.0, eta=0.01, rho=-2.7, mean_temp=253e3, kappa=-2.55, distribution = "Gaussian"):
         """
         This creates diffuse structure according to Eq. 55 from Trott+2016.
 
@@ -304,30 +316,31 @@ class CoreDiffuseForegrounds(ForegroundsBase):
 
         .. math:: \left(\frac{2k_B}{\lambda^2}\right)^2 \Omega (eta \bar{T}_B) \left(\frac{u}{u_0}\right)^{\rho} \left(\frac{\nu}{100 {\rm MHz}}\right)^{\kappa}
         """
-        raise NotImplementedError("This is not working atm.")
 
         logger.info("Populating diffuse foregrounds...")
         t1 = time.time()
 
         # Calculate mean flux density per frequency. Remember to take the square root because the Power is squared.
-        Tbar = np.sqrt((frequencies / 1e8) ** kappa * mean_temp ** 2)
+        Tbar = (self.frequencies / 1e8) ** kappa *  np.sqrt(mean_temp ** 2)
         power_spectrum = lambda u: eta ** 2 * (u / u0) ** rho
 
-        # Create a log normal distribution of fluctuations
-        pb = LogNormalPowerBox(N=ncells, pk=power_spectrum, dim=2, boxlength=sky_size[0], a=0, b=2 * np.pi, seed=1234)
+        # Create a distribution of fluctuations
+        if distribution == "Lognormal":
+            pb = LogNormalPowerBox(N=self.n_cells, pk=power_spectrum, dim=2, boxlength = self.sky_size, a=0, b=2 * np.pi, seed=1234)
+        elif distribution == "Gaussian":
+            pb = PowerBox(N=self.n_cells, pk=power_spectrum, dim=2, boxlength = self.sky_size, a=0, b=2 * np.pi, seed=1234)
 
-        density = pb.delta_x() + 1
+        density = np.abs(pb.delta_x() + 1) # no negative overdensity region 
 
         # Multiply the inherent fluctuations by the mean flux density.
         if np.std(density) > 0:
-            Tbins = np.outer(density, Tbar).reshape((ncells, ncells, len(frequencies)))
+            Tbins = np.outer(density, Tbar).reshape((self.n_cells, self.n_cells, len(self.frequencies)))
         else:
-            Tbins = np.zeros((ncells, ncells, len(frequencies)))
-            for i in range(len(frequencies)):
+            Tbins = np.zeros((self.n_cells, self.n_cells, len(self.frequencies)))
+            for i in range(len(self.frequencies)):
                 Tbins[:, :, i] = Tbar[i]
 
-        logger.info(f"\t... took {time.time() - t1} sec.")
-        return Tbins
+        return UnitArray(Tbins, unit= 'mK')
 
 
 class CoreInstrumental(CoreBase):
@@ -340,7 +353,8 @@ class CoreInstrumental(CoreBase):
 
     def __init__(self, *, antenna_posfile, freq_min, freq_max, nfreq, tile_diameter=4.0, max_bl_length=None,
                  integration_time=120, Tsys=240, effective_collecting_area=21.0, n_obs = 1, nparallel = 1,
-                 sky_extent=3, n_cells=300, add_beam=True, padding_size = 3,
+                 sky_extent=3, n_cells=300, add_beam=True, padding_size = 3, ERS = True, tot_daily_obs_time = 6,
+                 int_time = 600, declination=-26., RA_pointing = 0,
                  **kwargs):
         """
         Parameters
@@ -415,8 +429,15 @@ class CoreInstrumental(CoreBase):
         self.padding_size = padding_size
         self.n_obs = n_obs
         self.nparallel = nparallel
-
         self.effective_collecting_area = effective_collecting_area * un.m ** 2
+
+        self.tot_daily_obs_time = tot_daily_obs_time
+        self.int_time = int_time
+        self.ERS = ERS
+        self.RA_pointing = RA_pointing
+        #not sure if this should be attributed to self at this point
+        declination = declination
+
 
         if self.effective_collecting_area > self.tile_diameter ** 2:
             warnings.warn("The effective collecting area (%s) is greater than the tile diameter squared!")
@@ -441,17 +462,27 @@ class CoreInstrumental(CoreBase):
 
             # Find all the possible combination of tile displacement
             # baselines is a dim2 array of x and y displacements.
-            self._baselines = self.get_baselines(ant_pos[:, 1], ant_pos[:, 2]) * un.m
+            uv = np.zeros((int(len(ant_pos)*(len(ant_pos)-1)/2),3))
+
+            # assuming the final column is the z displacement, read the second and third columns from the back
+            uv[:,:2] = self.get_baselines(ant_pos[:, -3], ant_pos[:, -2])
+
+            if self.ERS == False:
+                self._baselines = uv[:,:2] * un.m
+            else:
+                logger.info("Doing things with earth rotation")
+                self._baselines = self.get_baselines_rotation(uv, self.tot_daily_obs_time, self.int_time, declination, self.RA_pointing) * un.m
 
             if self.max_bl_length:
                 self._baselines = self._baselines[
                     self._baselines[:, 0].value ** 2 + self._baselines[:, 1].value ** 2 <= self.max_bl_length ** 2]
+            
 
     @cached_property
     def lightcone_core(self):
         "Lightcone core module"
         for m in self._cores:
-            if isinstance(m, p21.mcmc.core.CoreLightConeModule):
+            if isinstance(m, CoreLightConeModule):
                 return m  # Doesn't really matter which one, we only want to access basic properties.
 
         # If nothing is returned, we don't have a lightcone
@@ -464,13 +495,43 @@ class CoreInstrumental(CoreBase):
 
     @property
     def sky_size(self):
-        "The sky size in lm co-ordinates. This is the size *all the way across*"
-        return self._sky_extent #* self._sky_extent * np.max(self.sigma(self.instrumental_frequencies))
+        "The sky size in lm co-ordinates. This is the size *for the simulation box only*"
+        return self._sky_extent 
 
 #    @cached_property
 #    def sky_coords(self):
 #        """Grid-coordinates of the (stitched/coarsened) simulation in lm units"""
 #        return np.linspace(-self.sky_size / 2, self.sky_size / 2, self.n_cells)
+
+    def theta_phi_to_lm(self, theta, phi):
+        '''
+        Convert theta phi (radian) to lm (unitless)
+
+        '''
+
+        l = np.sin(theta) * np.cos(phi)
+        m = np.sin(theta) * np.sin(phi)
+
+        return l, m
+
+    def lm_to_theta_phi(self, l, m):
+        '''
+        Convert lm (unitless) to theta phi (radian) by solving for:
+
+        l = sin(theta) * cos(phi)
+        m = sin(theta) * sin(phi)
+
+        '''
+        # solve for phi first so we can plug-in
+        phi = np.arctan(m / l)
+
+        theta = np.arcsin(l / np.cos(phi))
+
+        #phi is undefined for theta = 0 so need to correct for this
+        index = np.where(theta == 0)
+        phi[index] = 0
+
+        return theta, phi
 
     @cached_property
     def cell_size(self):
@@ -558,25 +619,29 @@ class CoreInstrumental(CoreBase):
             box += self.prepare_sky_lightcone(lightcone.brightness_temp)
 
             ctx.remove("lightcone")
-            del lightcone
+            del lightcone # to save memory
         
         # Now get foreground visibilities and add them in
         foregrounds = ctx.get("foregrounds", [])
 
         # Get the total brightness
         for fg, cls in zip(foregrounds, self.foreground_cores):
-            box += self.prepare_sky_foreground(fg, cls)
+            if fg.unit == "mK":
+                box += self.prepare_sky_foreground(fg, cls) * self.mK_to_Jy_per_sr(self.instrumental_frequencies)
+            else: # should be in Jy
+                box += self.prepare_sky_foreground(fg, cls)
 
         if (np.max(box)==np.min(box)): #both EoR signal and foregrounds are zero
             vis = np.zeros((len(self.baselines), len(self.instrumental_frequencies)), dtype=np.complex128)
+        elif self.ERS == True:
+            vis = self.add_instrument_rotation(box)
         else:
             vis = self.add_instrument(box)
 
         ctx.add("visibilities", vis)
-
-        # TODO: These aren't strictly necessary
-        ctx.add("baselines", self.baselines)
-        ctx.add("frequencies", self.instrumental_frequencies)
+        np.save("trueparams-160MHz_vis.npy", vis)
+        
+        # This isn't strictly necessary
         ctx.add("baselines_type", self.antenna_posfile)
 
     @staticmethod
@@ -586,9 +651,10 @@ class CoreInstrumental(CoreBase):
         vector[-pad_width[1]:] = pad_value
         return vector
 
-    def padding_image(self, image_cube, sky_size, big_sky_size):
+    def padding_image(self, image_cube, sky_size, big_sky_size, time_passed = 0, zenith_angle=45, azimuth_angle=30):
         """
-        Generate a spatial padding in image cube.
+        Generate a spatial padding in image cube. If ERS is present, assume that we
+        start observing 45 degrees from horizon.
 
         Parameters
         ----------
@@ -607,7 +673,9 @@ class CoreInstrumental(CoreBase):
             The sky padded with zeros along the l,m plane.
         """
         sky = []
-        N_pad = int((big_sky_size - sky_size)/(2.0 * sky_size) * np.shape(image_cube)[0])
+
+        N_pad = int((big_sky_size - sky_size) / (2.0 * sky_size) * np.shape(image_cube)[0])
+
         for jj in range(np.shape(image_cube)[-1]):
             sky.append(np.pad(image_cube[:,:,jj], N_pad, self.pad_with))
 
@@ -620,7 +688,7 @@ class CoreInstrumental(CoreBase):
 
         # Find beam attenuation
         if self.add_beam is True:
-            lightcone *= self.beam(self.instrumental_frequencies)
+            lightcone *= self.gaussian_beam(self.instrumental_frequencies)
         
         if self.padding_size is not None:
             lightcone = self.padding_image(lightcone, self.sky_size, self.padding_size * self.sky_size)
@@ -641,29 +709,49 @@ class CoreInstrumental(CoreBase):
 
         return visibilities
 
-#    @cached_property
-#    def uv_grid(self):
-#        """The grid of uv along one side"""
-#        return fftfreq(N=self.n_cells, d=self.cell_size, b=2 * np.pi)
+    @profile
+    def add_instrument_rotation(self, lightcone):
+
+        all_visibilities = np.zeros((len(self.baselines), len(self.instrumental_frequencies)), dtype=np.complex128)
+
+        L = int(len(self.baselines) / self.number_of_snapshots)
+
+        for ii in range(self.number_of_snapshots):
+
+            # Find beam attenuation
+            if self.add_beam is True:
+                lightcone_new = lightcone * self.gaussian_beam(self.instrumental_frequencies)
+            else:
+                lightcone_new = lightcone
+            
+            # Fourier Transform over the (l,m) dimension 
+            if self.padding_size is not None:
+                lightcone_new = self.padding_image(lightcone_new, self.sky_size, self.padding_size * self.sky_size, self.int_time * ii)
+
+                lightcone_new, uv = self.image_to_uv(lightcone_new, self.padding_size * self.sky_size)
+            else:
+                # Fourier transform image plane to UV plane.
+                lightcone_new, uv = self.image_to_uv(lightcone_new, self.sky_size)
+
+            # baselines sampling
+            if self.antenna_posfile != "grid_centres":
+                if(self.nparallel==1):
+                    all_visibilities[ii*L:(ii+1)*L] = self.sample_onto_baselines(lightcone_new, uv, self.baselines[ii*L:(ii+1)*L], self.instrumental_frequencies)
+                else:
+                    all_visibilitie[ii*L:(ii+1)*L] = self.sample_onto_baselines_parallel(lightcone_new, uv, self.baselines[ii*L:(ii+1)*L], self.instrumental_frequencies)
+            else:
+                all_visibilities = lightcone
+                self.baselines = uv[1]
+      
+        return all_visibilities
 
     @cached_property
     def baselines(self):
         """The baselines of the array, in m"""
-        #        if self._baselines is None:
-        #            baselines = np.zeros((len(self.uv_grid) ** 2, 2))
-        #            U, V = np.meshgrid(self.uv_grid, self.uv_grid)
-        #            baselines[:, 0] = U.flatten() * (const.c / np.min(self.instrumental_frequencies))
-        #            baselines[:, 1] = V.flatten() * (const.c / np.min(self.instrumental_frequencies))
-        #            baselines = baselines * un.m
-        #
-        #            # Remove auto-correlations
-        #            #baselines = baselines[baselines[:, 0] ** 2 + baselines[:, 1] ** 2 > 1.0 * un.m ** 2]
-        #            return baselines
-        #        else:
-        if self._baselines is not None:
-            return self._baselines.value
+        if self._baselines is None:
+            return None
         else:
-            return self._baselines
+            return self._baselines.value
 
     def sigma(self, frequencies):
         "The Gaussian beam width at each frequency"
@@ -687,7 +775,7 @@ class CoreInstrumental(CoreBase):
         sig = self.sigma(frequencies)
         return np.pi * sig ** 2
 
-    def beam(self, frequencies, min_attenuation = 5e-7):
+    def gaussian_beam(self, frequencies, min_attenuation = 5e-7):
         """
         Generate a frequency-dependent Gaussian beam attenuation across the sky per frequency.
 
@@ -955,6 +1043,84 @@ class CoreInstrumental(CoreBase):
         zeros = np.logical_and(Xsep.flatten() == 0, Ysep.flatten() == 0)
 
         return np.array([Xsep.flatten()[np.logical_not(zeros)], Ysep.flatten()[np.logical_not(zeros)]]).T
+
+    @cached_property
+    def number_of_snapshots(self):
+        return int(self.tot_daily_obs_time * 60 * 60 / self.int_time)
+
+    def get_baselines_rotation(self, pos_file, tot_daily_obs_time = 6, int_time = 600, declination=-26., RA_pointing = 0):
+        """
+        From a set of antenna positions, determine the non-autocorrelated baselines with Earth rotation synthesis, assuming
+        a flat sky.
+
+        Parameters
+        ----------
+        pos_file : 2D array.
+            The (x, y , z) positions of the arrays (presumably in metres).
+
+        tot_daily_obs_time: float
+            The total observation time per day in hours.
+
+        int_time:
+
+        Returns
+        -------
+        new_baselines : (n_baselines,2)-array
+            Each row is the (x,y) co-ordinate of a baseline, in the same units as x,y.
+        """
+
+        new_baselines = np.zeros((self.number_of_snapshots*len(pos_file), 2))
+
+        for ii in range(self.number_of_snapshots):
+            new_baselines[ii*len(pos_file):(ii+1)*len(pos_file),:] = self.earth_rotation_synthesis(pos_file, ii, int_time, declination=declination, RA_pointing = RA_pointing)
+
+        return new_baselines # only return the x,y part
+
+    @profile
+    @staticmethod
+    def earth_rotation_synthesis(Nbase, slice_num, int_time, declination=-26., RA_pointing = 0):
+        """
+        The rotation of the earth over the observation times makes changes the part of the 
+        sky measured by each antenna.
+        Based on https://science.nrao.edu/science/meetings/2016/15th-synthesis-imaging-workshop/SISS15Advanced.pdf
+
+        Parameters
+        ----------
+        Nbase       : ndarray
+            The array containing all the ux,uy,uz values of the antenna configuration.
+        slice_num   : int
+            The number of the observed slice after each of the integration time.
+        int_time    : float
+            The time after which the signal is recorded (in seconds).
+        declination : float
+            Refers to the lattitute where telescope is located 
+            (in degrees). Default: -27
+        RA_pointing : float
+            Refers to the RA of the observation
+            (in hours!). Default: 0
+
+        Returns
+        -------
+        new_Nbase   : ndarray
+            It is the new Nbase calculated for the rotated antenna configurations.
+        """
+
+        # change everything in degree to radian because numpy does things in radian
+        deg_to_rad = np.pi / 180.
+
+        delta = deg_to_rad * declination
+
+        one_hour = 15.0 * deg_to_rad # the rotation in radian after an hour
+
+        # multiply by the total observation time and number of slices
+        # also offset by the RA pointing
+        HA    =  one_hour * (slice_num - 1) * int_time / (60 * 60) + RA_pointing * 15 * deg_to_rad
+        
+        new_Nbase = np.zeros((len(Nbase),2))
+        new_Nbase[:,0] = np.sin(HA) * Nbase[:,0] + np.cos(HA) * Nbase[:,1]
+        new_Nbase[:,1] = -1.0 * np.sin(delta) * np.cos(HA) * Nbase[:,0] + np.sin(delta) * np.sin(HA) * Nbase[:,1]
+
+        return new_Nbase
 
     @property
     def thermal_variance_baseline(self):
